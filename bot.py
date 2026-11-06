@@ -23,7 +23,9 @@ MELONLY_API_KEY = os.getenv("MELONLY_API_KEY")
 ERLC_SERVER_KEY = os.getenv("ERLC_SERVER_KEY")
 
 # ER:LC official Ed25519 Public Key for webhook signature validation
-ERLC_PUBLIC_KEY = VerifyKey(base64.b64decode("MCowBQYDK2VwAyEAjSICb9pp0kHizGQtdG8ySWsDChfGqi+gyFCttigBNOA="))
+# We extract the last 32 bytes from the 44-byte DER-encoded string
+_erlc_der_key = base64.b64decode("MCowBQYDK2VwAyEAjSICb9pp0kHizGQtdG8ySWsDChfGqi+gyFCttigBNOA=")
+ERLC_PUBLIC_KEY = VerifyKey(_erlc_der_key[-32:])
 
 # --- Channel Configuration ---
 # Your specific Discord Channel IDs in Ontario Border Roleplay
