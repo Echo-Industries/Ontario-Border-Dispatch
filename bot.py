@@ -7,6 +7,7 @@ import asyncio
 import re
 import os
 import datetime
+import time
 from gtts import gTTS
 from dotenv import load_dotenv
 
@@ -19,7 +20,7 @@ MELONLY_API_KEY = os.getenv("MELONLY_API_KEY")
 ERLC_SERVER_KEY = os.getenv("ERLC_SERVER_KEY")
 
 # --- Channel Configuration ---
-# Replace these with your actual Discord Channel IDs in Ontario Border Roleplay
+# Your specific Discord Channel IDs in Ontario Border Roleplay
 WAITING_ROOM_ID = 1567191463203446804  # VC for Frequency Change
 
 WORKER_CONFIGS = {
@@ -148,7 +149,9 @@ class MainBot(commands.Bot):
         intents = discord.Intents.default()
         intents.members = True
         intents.voice_states = True
+        intents.message_content = True  # Required to read mentions/pings
         super().__init__(command_prefix="!", intents=intents)
+        self.start_time = time.time()
 
     async def setup_hook(self):
         await self.tree.sync()
@@ -190,6 +193,24 @@ class MainBot(commands.Bot):
                                 await self.play_waiting_room_warning("Frequency change: You were moved to waiting room because you switched to the civilian team.")
 
 main_bot = MainBot()
+
+# --- Reusable Bot Info Embed Generator ---
+def get_botinfo_embed():
+    uptime_seconds = int(time.time() - main_bot.start_time)
+    uptime_str = str(datetime.timedelta(seconds=uptime_seconds))
+    
+    embed = discord.Embed(title="🤖 Bot Information", color=discord.Color.blurple())
+    
+    # Attach the logo via discord.File reference
+    embed.set_thumbnail(url="attachment://bot_logo.jpg")
+    
+    embed.add_field(name="Developer", value="Krypton Peak Technologies", inline=True)
+    embed.add_field(name="Uptime", value=uptime_str, inline=True)
+    embed.add_field(name="Network Ping", value=f"{round(main_bot.latency * 1000)}ms", inline=True)
+    embed.add_field(name="Active Framework", value="discord.py / aiohttp", inline=True)
+    
+    embed.set_footer(text="Ontario Border Dispatch System")
+    return embed
 
 # --- Main Bot Commands ---
 @main_bot.tree.command(name="sync", description="Sync your team status and callsign with Discord")
@@ -244,6 +265,47 @@ async def frequency(interaction: discord.Interaction, freq: str):
     await interaction.user.move_to(target_channel)
     await interaction.response.send_message(f"📻 Tuned to **{channel_name}**.", ephemeral=True)
 
+@main_bot.tree.command(name="botinfo", description="Displays system information about the dispatch bot")
+async def botinfo(interaction: discord.Interaction):
+    file = discord.File("Ontario Border Dispatch Logo.jpg", filename="bot_logo.jpg")
+    embed = get_botinfo_embed()
+    await interaction.response.send_message(embed=embed, file=file)
+
+@main_bot.tree.command(name="botstatus", description="Displays the live connection status of all dispatcher bots")
+async def botstatus(interaction: discord.Interaction):
+    embed = discord.Embed(title="📊 Dispatch Network Status", color=discord.Color.green())
+    
+    main_ping = round(main_bot.latency * 1000)
+    embed.add_field(name="Main Dispatch (Sync & Webhooks)", value=f"🟢 Online ({main_ping}ms)", inline=False)
+    
+    for dept, worker in workers.items():
+        if worker.is_ready():
+            worker_ping = round(worker.latency * 1000)
+            status = f"🟢 Online ({worker_ping}ms)"
+        else:
+            status = "🔴 Offline / Disconnected"
+            embed.color = discord.Color.red()
+            
+        embed.add_field(name=f"{worker.bot_name} ({dept.upper()})", value=status, inline=False)
+    
+    embed.set_footer(text="Ontario Border Dispatch System")
+    await interaction.response.send_message(embed=embed)
+
+# --- Message Events (Ping Detection) ---
+@main_bot.event
+async def on_message(message):
+    if message.author.bot:
+        return
+
+    # Trigger if the bot is pinged directly (and it isn't an @everyone ping)
+    if main_bot.user.mentioned_in(message) and not message.mention_everyone:
+        file = discord.File("Ontario Border Dispatch Logo.jpg", filename="bot_logo.jpg")
+        embed = get_botinfo_embed()
+        await message.channel.send(embed=embed, file=file)
+
+    # Process other commands normally
+    await main_bot.process_commands(message)
+
 # --- Voice Events (Callsign Enforcement) ---
 @main_bot.event
 async def on_voice_state_update(member, before, after):
@@ -286,7 +348,19 @@ async def on_voice_state_update(member, before, after):
         except discord.Forbidden:
             pass
 
-# --- ER:LC Webhook Server (Audio & Text Embeds) ---
+# --- ER:LC Webhook Server (Audio, Text, & Web Page Routes) ---
+
+# Web page route handler
+async def serve_index(request):
+    return web.FileResponse('./index.html')
+
+# Image route handlers for the web page
+async def serve_bot_logo(request):
+    return web.FileResponse('./Ontario Border Dispatch Logo.jpg')
+
+async def serve_kp_logo(request):
+    return web.FileResponse('./KryptonPeak Logo.png')
+
 async def handle_erlc_webhook(request):
     try:
         data = await request.json()
@@ -333,7 +407,15 @@ async def handle_erlc_webhook(request):
 
 async def start_webhook_server():
     app = web.Application()
+    
+    # Static web page routes
+    app.router.add_get("/", serve_index)
+    app.router.add_get("/Ontario Border Dispatch Logo.jpg", serve_bot_logo)
+    app.router.add_get("/KryptonPeak Logo.png", serve_kp_logo)
+    
+    # Existing API route
     app.router.add_post("/erlc-webhook", handle_erlc_webhook)
+    
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", 8080)
