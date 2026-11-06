@@ -8,6 +8,7 @@ import re
 import os
 import datetime
 import time
+import uuid
 import base64
 from nacl.signing import VerifyKey
 from nacl.exceptions import BadSignatureError
@@ -23,12 +24,10 @@ MELONLY_API_KEY = os.getenv("MELONLY_API_KEY")
 ERLC_SERVER_KEY = os.getenv("ERLC_SERVER_KEY")
 
 # ER:LC official Ed25519 Public Key for webhook signature validation
-# We extract the last 32 bytes from the 44-byte DER-encoded string
 _erlc_der_key = base64.b64decode("MCowBQYDK2VwAyEAjSICb9pp0kHizGQtdG8ySWsDChfGqi+gyFCttigBNOA=")
 ERLC_PUBLIC_KEY = VerifyKey(_erlc_der_key[-32:])
 
 # --- Channel Configuration ---
-# Your specific Discord Channel IDs in Ontario Border Roleplay
 WAITING_ROOM_ID = 1567191463203446804  # VC for Frequency Change
 
 WORKER_CONFIGS = {
@@ -56,7 +55,6 @@ TEXT_CHANNELS = {
     "staff_log": 1568057421589643324 # All-calls staff log
 }
 
-# The only channels where users can run slash commands like /botinfo
 ALLOWED_COMMAND_CHANNELS = [
     1521204407687975113, # Bot Commands
     1523575437278576660, # Staff Commands
@@ -69,9 +67,17 @@ ERLC_API_URL = "https://api.erlc.gg/v2/server"
 EMERGENCY_TEAMS = ["police", "sheriff", "fire", "rescue", "transportation", "dot"]
 CALLSIGN_REGEX = re.compile(r"^[A-Z0-9\-]+\s\|\s.+")
 
+# --- Thread-Safe TTS Generator ---
+def generate_tts_file(text, filename):
+    """Generates the MP3 file safely without freezing the Discord client"""
+    try:
+        tts = gTTS(text=text, lang='en', slow=False)
+        tts.save(filename)
+    except Exception as e:
+        print(f"Failed to generate TTS: {e}")
+
 # --- API Fetcher Utility ---
 async def fetch_user_game_data(discord_id: int):
-    """Checks Melonly and ER:LC for player data."""
     async with aiohttp.ClientSession() as session:
         mel_headers = {"Authorization": f"Bearer {MELONLY_API_KEY}"}
         async with session.get(f"{MELONLY_API_URL}/server/members?discordId={discord_id}", headers=mel_headers) as resp:
@@ -102,12 +108,14 @@ async def fetch_user_game_data(discord_id: int):
 
 # --- Worker Bot Class ---
 class DispatchWorker(discord.Client):
-    def __init__(self, dept_name, vc_id, bot_name):
+    def __init__(self, dept_name, vc_id, bot_name, startup_delay):
         intents = discord.Intents.default()
+        intents.voice_states = True # Required for reliable voice channel joining
         super().__init__(intents=intents)
         self.dept_name = dept_name
         self.vc_id = vc_id
         self.bot_name = bot_name
+        self.startup_delay = startup_delay
         self.audio_queue = asyncio.Queue()
 
     async def setup_hook(self):
@@ -116,7 +124,9 @@ class DispatchWorker(discord.Client):
 
     async def audio_processor(self):
         await self.wait_until_ready()
-        await asyncio.sleep(2)  # Give Discord cache a moment to build
+        
+        # Stagger startups to prevent Discord IP rate-limiting
+        await asyncio.sleep(self.startup_delay) 
         
         channel = self.get_channel(self.vc_id)
         if not channel:
@@ -139,11 +149,14 @@ class DispatchWorker(discord.Client):
         while True:
             pre_text, call_text = await self.audio_queue.get()
             
-            pre_filename = f"pre_dispatch_{self.dept_name}.mp3"
-            call_filename = f"call_dispatch_{self.dept_name}.mp3"
+            # Generate unique filenames to prevent overwrite collisions
+            uid = uuid.uuid4().hex
+            pre_filename = f"pre_dispatch_{self.dept_name}_{uid}.mp3"
+            call_filename = f"call_dispatch_{self.dept_name}_{uid}.mp3"
             
-            gTTS(text=pre_text, lang='en', slow=False).save(pre_filename)
-            gTTS(text=call_text, lang='en', slow=False).save(call_filename)
+            # Offload generation to a thread to prevent green-ring stalling
+            await asyncio.to_thread(generate_tts_file, pre_text, pre_filename)
+            await asyncio.to_thread(generate_tts_file, call_text, call_filename)
 
             while vc.is_playing(): await asyncio.sleep(0.5)
 
@@ -152,26 +165,39 @@ class DispatchWorker(discord.Client):
             except discord.Forbidden:
                 pass
 
-            # Play with -loglevel quiet to suppress the console spam
-            vc.play(discord.FFmpegPCMAudio(pre_filename, options="-loglevel quiet"))
-            while vc.is_playing(): await asyncio.sleep(0.1)
+            if os.path.exists(pre_filename):
+                vc.play(discord.FFmpegPCMAudio(pre_filename, options="-loglevel quiet"))
+                while vc.is_playing(): await asyncio.sleep(0.1)
 
             await asyncio.sleep(2.5)
 
-            vc.play(discord.FFmpegPCMAudio(call_filename, options="-loglevel quiet"))
-            while vc.is_playing(): await asyncio.sleep(0.1)
+            if os.path.exists(call_filename):
+                vc.play(discord.FFmpegPCMAudio(call_filename, options="-loglevel quiet"))
+                while vc.is_playing(): await asyncio.sleep(0.1)
                 
             try:
                 await channel.set_permissions(me, priority_speaker=None)
             except discord.Forbidden:
                 pass
+                
+            # Cleanup files to save Railway disk space
+            await asyncio.sleep(1)
+            if os.path.exists(pre_filename): os.remove(pre_filename)
+            if os.path.exists(call_filename): os.remove(call_filename)
 
             self.audio_queue.task_done()
 
-# --- Initialize Worker Bots ---
+# --- Initialize Worker Bots (With Staggered Delays) ---
 workers = {}
+current_delay = 2
 for dept, config in WORKER_CONFIGS.items():
-    workers[dept] = DispatchWorker(dept_name=dept, vc_id=config["vc_id"], bot_name=config["name"])
+    workers[dept] = DispatchWorker(
+        dept_name=dept, 
+        vc_id=config["vc_id"], 
+        bot_name=config["name"], 
+        startup_delay=current_delay
+    )
+    current_delay += 5  # Each bot connects 5 seconds after the previous one
 
 # --- Main Bot Class (Ontario Border Dispatch) ---
 class MainBot(commands.Bot):
@@ -192,7 +218,7 @@ class MainBot(commands.Bot):
 
     async def on_ready(self):
         startup_embed = discord.Embed(
-            description="## ✅ Dispatch System Online\nOntario Border Dispatch and all departmental worker bots are now active and monitoring frequencies.",
+            description="## <:signal:1568381854497906738> Dispatch System Online\nOntario Border Dispatch and all departmental worker bots are now active and monitoring frequencies.",
             color=discord.Color.green(),
             timestamp=datetime.datetime.now(datetime.timezone.utc)
         )
@@ -212,8 +238,11 @@ class MainBot(commands.Bot):
         
         self.waiting_room_empty_minutes = 0
         
-        filename = "main_warning.mp3"
-        gTTS(text=text, lang='en', slow=False).save(filename)
+        uid = uuid.uuid4().hex
+        filename = f"main_warning_{uid}.mp3"
+        
+        # Offload TTS generation
+        await asyncio.to_thread(generate_tts_file, text, filename)
 
         vc = channel.guild.voice_client
         if not vc:
@@ -222,8 +251,14 @@ class MainBot(commands.Bot):
             await vc.move_to(channel)
 
         while vc.is_playing(): await asyncio.sleep(0.5)
-        # Play with -loglevel quiet to suppress the console spam
-        vc.play(discord.FFmpegPCMAudio(filename, options="-loglevel quiet"))
+        
+        if os.path.exists(filename):
+            vc.play(discord.FFmpegPCMAudio(filename, options="-loglevel quiet"))
+            while vc.is_playing(): await asyncio.sleep(0.1)
+            
+            # Cleanup
+            await asyncio.sleep(1)
+            if os.path.exists(filename): os.remove(filename)
 
     @tasks.loop(minutes=1)
     async def waiting_room_timeout_loop(self):
@@ -241,7 +276,6 @@ class MainBot(commands.Bot):
 
     @tasks.loop(seconds=60)
     async def auto_sync_loop(self):
-        """Continuously enforces RTO access and dynamically syncs nicknames"""
         for guild in self.guilds:
             for vc in guild.voice_channels:
                 if "RTO" in vc.name.upper():
