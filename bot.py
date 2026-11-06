@@ -8,6 +8,9 @@ import re
 import os
 import datetime
 import time
+import base64
+from nacl.signing import VerifyKey
+from nacl.exceptions import BadSignatureError
 from gtts import gTTS
 from dotenv import load_dotenv
 
@@ -18,6 +21,9 @@ load_dotenv()
 MAIN_BOT_TOKEN = os.getenv("MAIN_BOT_TOKEN")
 MELONLY_API_KEY = os.getenv("MELONLY_API_KEY")
 ERLC_SERVER_KEY = os.getenv("ERLC_SERVER_KEY")
+
+# ER:LC official Ed25519 Public Key for webhook signature validation
+ERLC_PUBLIC_KEY = VerifyKey(base64.b64decode("MCowBQYDK2VwAyEAjSICb9pp0kHizGQtdG8ySWsDChfGqi+gyFCttigBNOA="))
 
 # --- Channel Configuration ---
 # Your specific Discord Channel IDs in Ontario Border Roleplay
@@ -110,7 +116,6 @@ class DispatchWorker(discord.Client):
         await self.wait_until_ready()
         await asyncio.sleep(2)  # Give Discord cache a moment to build
         
-        # Robust fetch to ensure it finds the channel even if caching is delayed
         channel = self.get_channel(self.vc_id)
         if not channel:
             try:
@@ -122,7 +127,6 @@ class DispatchWorker(discord.Client):
         me = channel.guild.me
         vc = channel.guild.voice_client
 
-        # Aggressive connection retry loop
         while not vc or not vc.is_connected():
             try:
                 vc = await channel.connect()
@@ -146,12 +150,13 @@ class DispatchWorker(discord.Client):
             except discord.Forbidden:
                 pass
 
-            vc.play(discord.FFmpegPCMAudio(pre_filename))
+            # Play with -loglevel quiet to suppress the console spam
+            vc.play(discord.FFmpegPCMAudio(pre_filename, options="-loglevel quiet"))
             while vc.is_playing(): await asyncio.sleep(0.1)
 
             await asyncio.sleep(2.5)
 
-            vc.play(discord.FFmpegPCMAudio(call_filename))
+            vc.play(discord.FFmpegPCMAudio(call_filename, options="-loglevel quiet"))
             while vc.is_playing(): await asyncio.sleep(0.1)
                 
             try:
@@ -203,7 +208,6 @@ class MainBot(commands.Bot):
         channel = self.get_channel(WAITING_ROOM_ID)
         if not channel: return
         
-        # Reset inactivity timer immediately upon a new user entering
         self.waiting_room_empty_minutes = 0
         
         filename = "main_warning.mp3"
@@ -216,14 +220,14 @@ class MainBot(commands.Bot):
             await vc.move_to(channel)
 
         while vc.is_playing(): await asyncio.sleep(0.5)
-        vc.play(discord.FFmpegPCMAudio(filename))
+        # Play with -loglevel quiet to suppress the console spam
+        vc.play(discord.FFmpegPCMAudio(filename, options="-loglevel quiet"))
 
     @tasks.loop(minutes=1)
     async def waiting_room_timeout_loop(self):
         channel = self.get_channel(WAITING_ROOM_ID)
         if not channel or not channel.guild.voice_client: return
         
-        # Check if the bot is the only one in the channel
         non_bots = [m for m in channel.members if not m.bot]
         if len(non_bots) == 0:
             self.waiting_room_empty_minutes += 1
@@ -263,7 +267,6 @@ class MainBot(commands.Bot):
                             await member.move_to(waiting_room, reason="Dropped callsign")
                             await self.play_waiting_room_warning("Attention unit: Please set your in-game callsign before entering RTO.")
                         else:
-                            # Auto-sync nickname continuously
                             new_nick = f"{callsign} | {username}"
                             if member.display_name != new_nick:
                                 try:
@@ -389,10 +392,23 @@ async def serve_bot_logo(request):
     return web.FileResponse('./Ontario Border Dispatch Logo.jpg')
 
 async def serve_kp_logo(request):
-    return web.FileResponse('./KryptonPeak Logo.png')
+    return web.FileResponse('./Gemini_Generated_Image_u3ol41u3ol41u3ol.png')
 
 async def handle_erlc_webhook(request):
     try:
+        raw_body = await request.read()
+        signature_header = request.headers.get("X-Signature-Ed25519")
+        timestamp_header = request.headers.get("X-Signature-Timestamp")
+
+        if not signature_header or not timestamp_header:
+            return web.Response(status=400, text="Missing signature headers")
+
+        message = timestamp_header.encode("utf-8") + raw_body
+        try:
+            ERLC_PUBLIC_KEY.verify(message, bytes.fromhex(signature_header))
+        except (BadSignatureError, ValueError):
+            return web.Response(status=401, text="Invalid signature")
+
         data = await request.json()
         call_caller = data.get("Caller", "Unknown Caller")
         call_location = data.get("Location", "Unknown Location")
@@ -437,7 +453,7 @@ async def start_webhook_server():
     
     app.router.add_get("/", serve_index)
     app.router.add_get("/Ontario Border Dispatch Logo.jpg", serve_bot_logo)
-    app.router.add_get("/KryptonPeak Logo.png", serve_kp_logo)
+    app.router.add_get("/Gemini_Generated_Image_u3ol41u3ol41u3ol.png", serve_kp_logo)
     app.router.add_post("/erlc-webhook", handle_erlc_webhook)
     
     runner = web.AppRunner(app)
