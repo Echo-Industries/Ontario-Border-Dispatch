@@ -350,7 +350,7 @@ async def botstatus(interaction: discord.Interaction):
         await interaction.response.send_message(f"❌ Commands can only be used in designated bot channels (e.g., <#{ALLOWED_COMMAND_CHANNELS[0]}>).", ephemeral=True)
         return
 
-    desc = "## 📊 Dispatch Network Status\nLive connection metrics and monitoring statuses for the main router and all departmental workers."
+    desc = "## <:signal:1568381854497906738> Dispatch Network Status\nLive connection metrics and monitoring statuses for the main router and all departmental workers."
     embed = discord.Embed(description=desc, color=discord.Color.green())
     
     main_ping = round(main_bot.latency * 1000)
