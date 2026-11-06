@@ -20,31 +20,31 @@ ERLC_SERVER_KEY = os.getenv("ERLC_SERVER_KEY")
 
 # --- Channel Configuration ---
 # Replace these with your actual Discord Channel IDs in Ontario Border Roleplay
-WAITING_ROOM_ID = 123456789012345678  # VC for Frequency Change
+WAITING_ROOM_ID = 1567191463203446804  # VC for Frequency Change
 
 WORKER_CONFIGS = {
     "police": {
         "name": "CBSA Border Dispatch",
         "token": os.getenv("CBSA_BOT_TOKEN"),
-        "vc_id": 111111111111111111 
+        "vc_id": 1527738899374280704
     },
     "fire": {
         "name": "OBFS Border Dispatch",
         "token": os.getenv("OBFS_BOT_TOKEN"),
-        "vc_id": 222222222222222222
+        "vc_id": 1527739186629710086
     },
     "dot": {
         "name": "MOT Border Dispatch",
         "token": os.getenv("MOT_BOT_TOKEN"),
-        "vc_id": 333333333333333333
+        "vc_id": 1527739511310909663
     }
 }
 
 TEXT_CHANNELS = {
-    "police": 111111111111111111,  # CBSA text log
-    "fire": 222222222222222222,    # OBFS text log
-    "dot": 333333333333333333,     # MOT text log
-    "staff_log": 444444444444444444 # All-calls staff log
+    "police": 1523672972764905492,  # CBSA text log
+    "fire": 1523673131959717938,    # OBFS text log
+    "dot": 1523673289791377448,     # MOT text log
+    "staff_log": 1568057421589643324 # All-calls staff log
 }
 
 # --- Constants & APIs ---
