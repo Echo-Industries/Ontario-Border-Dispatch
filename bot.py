@@ -354,19 +354,19 @@ async def botstatus(interaction: discord.Interaction):
     embed = discord.Embed(description=desc, color=discord.Color.green())
     
     main_ping = round(main_bot.latency * 1000)
-    embed.add_field(name="Main Dispatch (Sync & Routing)", value=f"🟢 Online ({main_ping}ms)", inline=False)
+    embed.add_field(name="Main Dispatch (Sync & Routing)", value=f"<:goodsignal:1568399560622211143> Online ({main_ping}ms)", inline=False)
     
     for dept, worker in workers.items():
         if worker.is_ready():
             worker_ping = round(worker.latency * 1000)
-            status = f"🟢 Online ({worker_ping}ms) - Monitoring <#{worker.vc_id}>"
+            status = f"<:goodsignal:1568399560622211143> Online ({worker_ping}ms) - Monitoring <#{worker.vc_id}>"
         else:
             status = "🔴 Offline / Disconnected"
             embed.color = discord.Color.red()
             
         embed.add_field(name=f"{worker.bot_name} ({dept.upper()})", value=status, inline=False)
     
-    embed.add_field(name="🌐 Webhook Server", value="🟢 Online (Port 8080)", inline=False)
+    embed.add_field(name="<:world:1568399069385203722> Webhook Server", value="🟢 Online (Port 8080)", inline=False)
     embed.set_footer(text="Ontario Border Dispatch System")
     await interaction.response.send_message(embed=embed)
 
