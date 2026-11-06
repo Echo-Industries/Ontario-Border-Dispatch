@@ -283,19 +283,19 @@ def get_botinfo_embed():
     unix_start = int(main_bot.start_time)
     
     desc = (
-        "## 🤖 Bot Information\n"
+        "## <:bot:1568382041672917193> Bot Information\n"
         "The core routing and enforcement system for the **Ontario Border Roleplay** communications network.\n\n"
-        f"**📡 Uptime:** <t:{unix_start}:R>\n"
-        f"**📶 Network Ping:** {round(main_bot.latency * 1000)}ms\n"
-        "**🛠️ Architecture:** `discord.py` & `aiohttp` web server\n"
-        f"**⚙️ Worker Nodes:** {len(workers)} active departmental bots\n"
-        "**🎙️ Voice Protocol:** `davey` (E2EE Enabled)\n"
+        f"**<:wifihigh:1568381086608662638> Uptime:** <t:{unix_start}:R>\n"
+        f"**<:signal:1568381854497906738> Network Ping:** {round(main_bot.latency * 1000)}ms\n"
+        "**<:database:1568381596363657216> Architecture:** `discord.py` & `aiohttp` web server\n"
+        f"**<:settings:1568382499187462306> Worker Nodes:** {len(workers)} active departmental bots\n"
+        "**<:mic:1568379901978091651> Voice Protocol:** `davey` (E2EE Enabled)\n"
     )
     
     embed = discord.Embed(description=desc, color=discord.Color.blurple())
     embed.set_thumbnail(url="attachment://bot_logo.jpg")
-    embed.add_field(name="Developer", value="[Krypton Peak Technologies](https://kryptonpeak.com)", inline=True)
-    embed.add_field(name="Monitoring", value=f"{len(EMERGENCY_TEAMS)} Emergency Teams", inline=True)
+    embed.add_field(name="<:github:1568382792385962044> Developer", value="[Krypton Peak Technologies](https://kryptonpeak.com)", inline=True)
+    embed.add_field(name="<:shield:1568383105188892823> Monitoring", value=f"{len(EMERGENCY_TEAMS)} Emergency Teams", inline=True)
     embed.set_footer(text="Ontario Border Dispatch System")
     return embed
 
@@ -394,7 +394,7 @@ async def serve_bot_logo(request):
     return web.FileResponse('./Ontario Border Dispatch Logo.jpg')
 
 async def serve_kp_logo(request):
-    return web.FileResponse('./Gemini_Generated_Image_u3ol41u3ol41u3ol.png')
+    return web.FileResponse('./KrpytonPeak Logo.png')
 
 async def handle_erlc_webhook(request):
     try:
@@ -455,7 +455,7 @@ async def start_webhook_server():
     
     app.router.add_get("/", serve_index)
     app.router.add_get("/Ontario Border Dispatch Logo.jpg", serve_bot_logo)
-    app.router.add_get("/Gemini_Generated_Image_u3ol41u3ol41u3ol.png", serve_kp_logo)
+    app.router.add_get("/KrpytonPeak Logo.png", serve_kp_logo)
     app.router.add_post("/erlc-webhook", handle_erlc_webhook)
     
     runner = web.AppRunner(app)
