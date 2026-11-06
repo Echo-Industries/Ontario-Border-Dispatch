@@ -158,6 +158,24 @@ class MainBot(commands.Bot):
         self.auto_sync_loop.start()
         print("Ontario Border Dispatch online.")
 
+    async def on_ready(self):
+        # Generates and sends a startup embed to all text log channels
+        startup_embed = discord.Embed(
+            title="✅ Dispatch System Online",
+            description="Ontario Border Dispatch and all departmental worker bots are now active and monitoring frequencies.",
+            color=discord.Color.green(),
+            timestamp=datetime.datetime.now(datetime.timezone.utc)
+        )
+        startup_embed.set_footer(text="Ontario Border Dispatch System")
+
+        for dept_name, channel_id in TEXT_CHANNELS.items():
+            channel = self.get_channel(channel_id)
+            if channel:
+                try:
+                    await channel.send(embed=startup_embed)
+                except discord.Forbidden:
+                    print(f"Missing permissions to send startup embed in {dept_name} channel.")
+
     async def play_waiting_room_warning(self, text: str):
         channel = self.get_channel(WAITING_ROOM_ID)
         if not channel: return
