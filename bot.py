@@ -15,6 +15,13 @@ from nacl.exceptions import BadSignatureError
 from gtts import gTTS
 from dotenv import load_dotenv
 
+# Try to import davey for E2EE Voice Support
+try:
+    import davey
+    DAVEY_INSTALLED = True
+except ImportError:
+    DAVEY_INSTALLED = False
+
 # Load environment variables from .env file
 load_dotenv()
 
@@ -80,13 +87,31 @@ async def fetch_user_game_data(discord_id: int):
     async with aiohttp.ClientSession() as session:
         mel_headers = {"Authorization": f"Bearer {MELONLY_API_KEY}"}
         async with session.get(f"{MELONLY_API_URL}/server/members?discordId={discord_id}", headers=mel_headers) as resp:
-            if resp.status != 200: return None, "melonly_error"
+            if resp.status != 200: 
+                print(f"[SYNC ERROR] Melonly API HTTP {resp.status}")
+                return None, "melonly_error"
+                
             mel_data = await resp.json()
             members = mel_data.get("data", [])
-            if not members: return None, "not_verified"
+            if not members: 
+                return None, "not_verified"
             
-            roblox_username = members[0].get("robloxUsername") or members[0].get("user", {}).get("username")
-            if not roblox_username: return None, "no_roblox_user"
+            # --- DEBUG LOGGING: Print exact Melonly API schema ---
+            print(f"[MELONLY DEBUG] Raw API response for {discord_id}: {members[0]}")
+            
+            # --- AGGRESSIVE DATA EXTRACTION ---
+            user_data = members[0]
+            roblox_username = (
+                user_data.get("robloxUsername") or 
+                user_data.get("robloxName") or 
+                user_data.get("robloxAccount", {}).get("username") or 
+                user_data.get("user", {}).get("username") or 
+                user_data.get("username")
+            )
+            
+            if not roblox_username: 
+                print(f"[SYNC ERROR] Could not extract Roblox username from data.")
+                return None, "no_roblox_user"
 
         erlc_headers = {"Server-Key": ERLC_SERVER_KEY}
         async with session.get(ERLC_API_URL, headers=erlc_headers) as resp:
@@ -240,7 +265,10 @@ class MainBot(commands.Bot):
         self.auto_sync_loop.start()
         self.waiting_room_timeout_loop.start()
         self.team_monitor_loop.start()
-        print("[MAIN] Ontario Border Dispatch online.")
+        
+        print(f"[MAIN] Ontario Border Dispatch online. (discord.py v{discord.__version__})")
+        if not DAVEY_INSTALLED:
+            print("[MAIN] CRITICAL WARNING: 'davey' library is missing. Discord E2EE voice will fail (Green Ring of Silence)!")
 
     async def on_ready(self):
         startup_embed = discord.Embed(
@@ -446,7 +474,7 @@ async def botstatus(interaction: discord.Interaction):
             
         embed.add_field(name=f"{worker.bot_name} ({dept.upper()})", value=status, inline=False)
     
-    embed.add_field(name="<:world:1568399069385203722> Webhook Server", value="🟢 Online (Port 8080)", inline=False)
+    embed.add_field(name="<:world:1568399069385203722> Webhook Server", value="<:port:1568429510666231938> Online (Port 8080)", inline=False)
     embed.set_footer(text="Ontario Border Dispatch System")
     await interaction.response.send_message(embed=embed)
 
