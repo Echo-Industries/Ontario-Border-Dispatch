@@ -15,9 +15,10 @@ from nacl.exceptions import BadSignatureError
 from gtts import gTTS
 from dotenv import load_dotenv
 
-# Try to import davey for E2EE Voice Support
+# --- DAVE E2EE Voice Patch ---
 try:
     import davey
+    davey.patch() # CRITICAL: This injects the E2EE encryption into discord.py
     DAVEY_INSTALLED = True
 except ImportError:
     DAVEY_INSTALLED = False
@@ -70,7 +71,6 @@ ALLOWED_COMMAND_CHANNELS = [
 MELONLY_API_URL = "https://api.melonly.xyz/api/v1"
 ERLC_API_URL = "https://api.erlc.gg/v2/server"
 EMERGENCY_TEAMS = ["police", "sheriff", "fire", "rescue", "transportation", "dot"]
-CALLSIGN_REGEX = re.compile(r"^[A-Z0-9\-]+\s\|\s.+")
 
 # --- Thread-Safe TTS Generator ---
 def generate_tts_file(text, filename):
@@ -78,61 +78,67 @@ def generate_tts_file(text, filename):
         print(f"[AUDIO] Generating TTS for: {text}")
         tts = gTTS(text=text, lang='en', slow=False)
         tts.save(filename)
-        print(f"[AUDIO] Successfully saved {filename} (Size: {os.path.getsize(filename)} bytes)")
     except Exception as e:
         print(f"[AUDIO ERROR] Failed to generate TTS: {e}")
 
-# --- API Fetcher Utility ---
-async def fetch_user_game_data(discord_id: int):
-    async with aiohttp.ClientSession() as session:
-        mel_headers = {"Authorization": f"Bearer {MELONLY_API_KEY}"}
-        async with session.get(f"{MELONLY_API_URL}/server/members?discordId={discord_id}", headers=mel_headers) as resp:
-            if resp.status != 200: 
-                print(f"[SYNC ERROR] Melonly API HTTP {resp.status}")
-                return None, "melonly_error"
+# --- Robust API Fetcher Utility ---
+async def fetch_user_game_data(member: discord.Member):
+    roblox_username = None
+    
+    # 1. Try Melonly Fetch
+    try:
+        async with aiohttp.ClientSession() as session:
+            mel_headers = {"Authorization": f"Bearer {MELONLY_API_KEY}"}
+            # Attempting to force Melonly to expand the User data object
+            async with session.get(f"{MELONLY_API_URL}/server/members?discordId={member.id}&expand=user,robloxAccount", headers=mel_headers) as resp:
+                if resp.status == 200:
+                    mel_data = await resp.json()
+                    members = mel_data.get("data", [])
+                    if members:
+                        u = members[0]
+                        roblox_username = (
+                            u.get("robloxUsername") or 
+                            u.get("robloxName") or 
+                            u.get("robloxAccount", {}).get("username") or 
+                            u.get("user", {}).get("username") or 
+                            u.get("username")
+                        )
+    except Exception as e:
+        print(f"[SYNC ERROR] Melonly Request Failed: {e}")
+
+    # 2. Check ER:LC Server (With Discord Nickname Fallback)
+    try:
+        async with aiohttp.ClientSession() as session:
+            erlc_headers = {"Server-Key": ERLC_SERVER_KEY}
+            async with session.get(ERLC_API_URL, headers=erlc_headers) as resp:
+                if resp.status != 200: return None, "erlc_error"
+                erlc_data = await resp.json()
+                players = erlc_data.get("Players", [])
+
+                # Fast Match: If Melonly successfully provided the exact username
+                if roblox_username:
+                    for p in players:
+                        if p.get("Player", "").split(":")[0].lower() == roblox_username.lower():
+                            return {"username": p.get("Player", "").split(":")[0], "team": p.get("Team", "Civilian"), "callsign": p.get("Callsign", None)}, "success"
+
+                # Fallback Match: Melonly failed, so check if any live ER:LC player's name is hiding inside the user's Discord Name
+                discord_names = [member.display_name.lower(), member.name.lower()]
+                if member.global_name: discord_names.append(member.global_name.lower())
+
+                for p in players:
+                    p_name = p.get("Player", "").split(":")[0]
+                    p_name_lower = p_name.lower()
+                    if any(p_name_lower in d_name for d_name in discord_names):
+                        print(f"[SYNC INFO] Melonly fallback used. Matched '{p_name}' via Discord profile.")
+                        return {"username": p_name, "team": p.get("Team", "Civilian"), "callsign": p.get("Callsign", None)}, "success"
                 
-            mel_data = await resp.json()
-            members = mel_data.get("data", [])
-            if not members: 
-                return None, "not_verified"
-            
-            # --- DEBUG LOGGING: Print exact Melonly API schema ---
-            print(f"[MELONLY DEBUG] Raw API response for {discord_id}: {members[0]}")
-            
-            # --- AGGRESSIVE DATA EXTRACTION ---
-            user_data = members[0]
-            roblox_username = (
-                user_data.get("robloxUsername") or 
-                user_data.get("robloxName") or 
-                user_data.get("robloxAccount", {}).get("username") or 
-                user_data.get("user", {}).get("username") or 
-                user_data.get("username")
-            )
-            
-            if not roblox_username: 
-                print(f"[SYNC ERROR] Could not extract Roblox username from data.")
-                return None, "no_roblox_user"
-
-        erlc_headers = {"Server-Key": ERLC_SERVER_KEY}
-        async with session.get(ERLC_API_URL, headers=erlc_headers) as resp:
-            if resp.status != 200: return None, "erlc_error"
-            erlc_data = await resp.json()
-            players = erlc_data.get("Players", [])
-
-            for p in players:
-                player_name = p.get("Player", "").split(":")[0]
-                if player_name.lower() == roblox_username.lower():
-                    return {
-                        "username": roblox_username,
-                        "team": p.get("Team", "Civilian"),
-                        "callsign": p.get("Callsign", None)
-                    }, "success"
-
-            return None, "not_in_game"
+                return None, "not_in_game"
+    except Exception as e:
+        print(f"[SYNC ERROR] ERLC Request Failed: {e}")
+        return None, "erlc_error"
 
 # --- In-Game PM Utility ---
 async def send_in_game_pm(player_name: str, message: str):
-    """Executes an in-game :pm command via the ER:LC API"""
     try:
         async with aiohttp.ClientSession() as session:
             headers = {"Server-Key": ERLC_SERVER_KEY, "Content-Type": "application/json"}
@@ -163,23 +169,20 @@ class DispatchWorker(discord.Client):
 
     @tasks.loop(seconds=15)
     async def connection_watcher(self):
-        """Persistent background task to guarantee VC connection"""
         channel = self.get_channel(self.vc_id)
         if not channel:
             try:
                 channel = await self.fetch_channel(self.vc_id)
-            except Exception as e:
-                print(f"[{self.bot_name}] VC Fetch Error: {e}")
+            except Exception:
                 return
             
         vc = channel.guild.voice_client
         if not vc or not vc.is_connected():
-            print(f"[{self.bot_name}] Not in VC. Attempting connection to {self.dept_name.upper()} RTO...")
             try:
                 await channel.connect()
                 print(f"[{self.bot_name}] ✅ Successfully connected to RTO.")
-            except Exception as e:
-                print(f"[{self.bot_name}] ❌ Connection failed: {e}")
+            except Exception:
+                pass # Fail silently, discord rate limits connection attempts dynamically
 
     async def audio_processor(self):
         await self.wait_until_ready()
@@ -193,7 +196,6 @@ class DispatchWorker(discord.Client):
             me = channel.guild.me
             
             if not vc or not vc.is_connected():
-                print(f"[{self.bot_name}] Dropped audio because bot is not connected to VC.")
                 self.audio_queue.task_done()
                 continue
 
@@ -212,20 +214,15 @@ class DispatchWorker(discord.Client):
                 pass
 
             if os.path.exists(pre_filename) and os.path.getsize(pre_filename) > 100:
-                print(f"[{self.bot_name}] Playing pre-dispatch audio...")
-                vc.play(discord.FFmpegPCMAudio(pre_filename, options="-loglevel quiet"))
+                # -loglevel error hides the bitrate warnings but exposes real crashes
+                vc.play(discord.FFmpegPCMAudio(pre_filename, options="-loglevel error"))
                 while vc.is_playing(): await asyncio.sleep(0.1)
-            else:
-                print(f"[{self.bot_name}] ❌ Pre-dispatch file missing or corrupted.")
 
             await asyncio.sleep(2.5)
 
             if os.path.exists(call_filename) and os.path.getsize(call_filename) > 100:
-                print(f"[{self.bot_name}] Playing call dispatch audio...")
-                vc.play(discord.FFmpegPCMAudio(call_filename, options="-loglevel quiet"))
+                vc.play(discord.FFmpegPCMAudio(call_filename, options="-loglevel error"))
                 while vc.is_playing(): await asyncio.sleep(0.1)
-            else:
-                print(f"[{self.bot_name}] ❌ Call dispatch file missing or corrupted.")
                 
             try:
                 await channel.set_permissions(me, priority_speaker=None)
@@ -268,11 +265,11 @@ class MainBot(commands.Bot):
         
         print(f"[MAIN] Ontario Border Dispatch online. (discord.py v{discord.__version__})")
         if not DAVEY_INSTALLED:
-            print("[MAIN] CRITICAL WARNING: 'davey' library is missing. Discord E2EE voice will fail (Green Ring of Silence)!")
+            print("[MAIN] CRITICAL WARNING: 'davey' library is missing or failed to patch!")
 
     async def on_ready(self):
         startup_embed = discord.Embed(
-            description="## <:signal:1568381854497906738> Dispatch System Online\nOntario Border Dispatch and all departmental worker bots are now active and monitoring frequencies. We apologize for any downtime and thank you for your patience.",
+            description="## <:signal:1568381854497906738> Dispatch System Online\nOntario Border Dispatch and all departmental worker bots are now active and monitoring frequencies.",
             color=discord.Color.green(),
             timestamp=datetime.datetime.now(datetime.timezone.utc)
         )
@@ -284,14 +281,13 @@ class MainBot(commands.Bot):
                 try:
                     await channel.send(embed=startup_embed)
                 except discord.Forbidden:
-                    print(f"[MAIN] Missing permissions to send startup embed in {dept_name} channel.")
+                    pass
 
     async def play_waiting_room_warning(self, text: str):
         channel = self.get_channel(WAITING_ROOM_ID)
         if not channel: return
         
         self.waiting_room_empty_minutes = 0
-        
         uid = uuid.uuid4().hex
         filename = f"main_warning_{uid}.mp3"
         
@@ -306,7 +302,7 @@ class MainBot(commands.Bot):
         while vc.is_playing(): await asyncio.sleep(0.5)
         
         if os.path.exists(filename) and os.path.getsize(filename) > 100:
-            vc.play(discord.FFmpegPCMAudio(filename, options="-loglevel quiet"))
+            vc.play(discord.FFmpegPCMAudio(filename, options="-loglevel error"))
             while vc.is_playing(): await asyncio.sleep(0.1)
             
             await asyncio.sleep(1)
@@ -321,7 +317,6 @@ class MainBot(commands.Bot):
         if len(non_bots) == 0:
             self.waiting_room_empty_minutes += 1
             if self.waiting_room_empty_minutes >= 15:
-                print("[MAIN] Waiting room empty for 15 minutes. Disconnecting.")
                 await channel.guild.voice_client.disconnect()
                 self.waiting_room_empty_minutes = 0
         else:
@@ -329,9 +324,7 @@ class MainBot(commands.Bot):
 
     @tasks.loop(seconds=30)
     async def team_monitor_loop(self):
-        """Polls ER:LC API to detect team changes and send PMs."""
         if not ERLC_SERVER_KEY: return
-            
         try:
             async with aiohttp.ClientSession() as session:
                 headers = {"Server-Key": ERLC_SERVER_KEY}
@@ -341,44 +334,29 @@ class MainBot(commands.Bot):
                     players = erlc_data.get("Players", [])
                     
                     current_teams = {}
-                    
                     for p in players:
                         player_name = p.get("Player", "").split(":")[0]
                         team = p.get("Team", "Civilian").lower()
                         current_teams[player_name] = team
-                        
                         is_emergency = any(k in team for k in EMERGENCY_TEAMS)
                         
                         if player_name in self.cached_player_teams:
                             old_team = self.cached_player_teams[player_name]
                             if old_team != team and is_emergency:
-                                print(f"[TEAM MONITOR] {player_name} joined {team.upper()}. Sending PM.")
-                                await send_in_game_pm(
-                                    player_name, 
-                                    "DISPATCH: Please wait 45 to 60 seconds for the database to sync before joining the Discord RTO."
-                                )
+                                await send_in_game_pm(player_name, "DISPATCH: Please wait 45 to 60 seconds for the database to sync before joining the Discord RTO.")
                         else:
                             if self.first_scan_complete and is_emergency:
-                                print(f"[TEAM MONITOR] New player {player_name} spawned as {team.upper()}. Sending PM.")
-                                await send_in_game_pm(
-                                    player_name, 
-                                    "DISPATCH: Please wait 45 to 60 seconds for the database to sync before joining the Discord RTO."
-                                )
+                                await send_in_game_pm(player_name, "DISPATCH: Please wait 45 to 60 seconds for the database to sync before joining the Discord RTO.")
                                 
                     self.cached_player_teams = current_teams
                     self.first_scan_complete = True
-        except Exception as e:
-            print(f"[TEAM MONITOR ERROR] {e}")
+        except Exception:
+            pass
 
     async def sync_member_rto(self, member, waiting_room):
-        """Processes a single member's RTO access with extensive logging"""
-        print(f"[SYNC] Processing {member.display_name} ({member.name})...")
-        player_data, status = await fetch_user_game_data(member.id)
+        player_data, status = await fetch_user_game_data(member)
         
-        print(f"[SYNC] {member.name} API Result -> Status: {status} | Data: {player_data}")
-
         if status != "success" or not player_data:
-            print(f"[SYNC KICK] {member.name} is not verified or not in game.")
             await member.move_to(waiting_room, reason="Not verified or left game")
             await self.play_waiting_room_warning("Attention player: You must be verified on Melonly and logged in to join RTO.")
             return
@@ -389,23 +367,21 @@ class MainBot(commands.Bot):
         is_emergency = any(keyword in team for keyword in EMERGENCY_TEAMS)
 
         if not is_emergency:
-            print(f"[SYNC KICK] {member.name} is on team: {team.upper()} (Civilian)")
             await member.move_to(waiting_room, reason="Switched to Civilian")
             await self.play_waiting_room_warning("Frequency change: You were moved to waiting room because you switched to the civilian team.")
         elif not callsign:
-            print(f"[SYNC KICK] {member.name} is on team {team.upper()} but has no callsign.")
             await member.move_to(waiting_room, reason="Dropped callsign")
             await self.play_waiting_room_warning("Attention unit: Please set your in-game callsign before entering RTO.")
         else:
             new_nick = f"{callsign} | {username}"
             if member.display_name != new_nick:
-                print(f"[SYNC UPDATE] Updating nickname for {member.name} to {new_nick}")
                 try:
                     await member.edit(nick=new_nick)
+                    print(f"[SYNC UPDATE] Updated {member.name} to {new_nick}")
                 except discord.Forbidden:
-                    print(f"[SYNC ERROR] Lacking permission to edit nickname for {member.name}")
-            else:
-                print(f"[SYNC OK] {member.name} is compliant.")
+                    print(f"[SYNC KICK] Permission denied. {member.name} has a higher discord role than the bot.")
+                    await member.move_to(waiting_room, reason="Bot lacks permission to enforce callsign formatting")
+                    await self.play_waiting_room_warning("Attention unit: Your Discord role is too high for me to set your callsign. Please set your nickname manually.")
 
     @tasks.loop(seconds=60)
     async def auto_sync_loop(self):
@@ -519,66 +495,74 @@ async def handle_erlc_webhook(request):
         timestamp_header = request.headers.get("X-Signature-Timestamp")
 
         if not signature_header or not timestamp_header:
-            print("[WEBHOOK ERROR] Missing security headers.")
             return web.Response(status=400, text="Missing signature headers")
 
         message = timestamp_header.encode("utf-8") + raw_body
+        
+        # ER:LC Webhooks use Base64 for their Ed25519 signature
         try:
-            ERLC_PUBLIC_KEY.verify(message, bytes.fromhex(signature_header))
-        except (BadSignatureError, ValueError):
-            print("[WEBHOOK ERROR] Invalid Ed25519 signature.")
-            return web.Response(status=401, text="Invalid signature")
+            sig_bytes = base64.b64decode(signature_header)
+            ERLC_PUBLIC_KEY.verify(message, sig_bytes)
+        except (BadSignatureError, ValueError, TypeError):
+            try:
+                ERLC_PUBLIC_KEY.verify(message, bytes.fromhex(signature_header))
+            except (BadSignatureError, ValueError):
+                print("[WEBHOOK ERROR] Invalid Ed25519 signature.")
+                return web.Response(status=401, text="Invalid signature")
 
         data = await request.json()
-        event_type = data.get("Type", "Unknown")
         
-        # Log all raw incoming webhook data for debugging purposes
-        print(f"[WEBHOOK RECEIVE] Type: {event_type} | Raw Data: {data}")
+        # Parse new ER:LC batched event array format
+        events = data.get("events", [data])
         
-        # ER:LC natively wraps data inside a "Data" payload. Fallback to root just in case.
-        payload = data.get("Data", data)
+        for event_payload in events:
+            event_type = event_payload.get("event", event_payload.get("Type", "Unknown"))
+            
+            if event_type == "WebhookProbe":
+                print("[WEBHOOK] Received ER:LC Probe. Validated and Acknowledged.")
+                continue
+                
+            payload = event_payload.get("data", event_payload)
+            if "Data" in payload:
+                payload = payload["Data"]
 
-        # Handle 911 Calls
-        if event_type == "Call911" or "Caller" in payload:
-            call_caller = payload.get("Caller", "Unknown Caller")
-            call_location = payload.get("Location", "Unknown Location")
-            call_details = payload.get("Details", "No details provided")
-            dept = payload.get("Department", "police").lower()
+            if event_type == "Call911" or "Caller" in payload:
+                call_caller = payload.get("Caller", "Unknown Caller")
+                call_location = payload.get("Location", "Unknown Location")
+                call_details = payload.get("Details", "No details provided")
+                dept = payload.get("Department", "police").lower()
 
-            if dept == "transportation": dept = "dot"
-            if dept == "sheriff": dept = "police" 
+                if dept == "transportation": dept = "dot"
+                if dept == "sheriff": dept = "police" 
 
-            print(f"[DISPATCH] Routing {dept.upper()} call from {call_caller}")
+                print(f"[DISPATCH] Routing {dept.upper()} call from {call_caller}")
 
-            pre_text = "There is an incoming call, please silence the RTO."
-            call_text = f"Caller: {call_caller}. Description: {call_details}. Location: {call_location}."
+                pre_text = "There is an incoming call, please silence the RTO."
+                call_text = f"Caller: {call_caller}. Description: {call_details}. Location: {call_location}."
 
-            if dept in workers:
-                await workers[dept].audio_queue.put((pre_text, call_text))
-            elif "police" in workers:
-                await workers["police"].audio_queue.put((pre_text, call_text))
+                if dept in workers:
+                    await workers[dept].audio_queue.put((pre_text, call_text))
+                elif "police" in workers:
+                    await workers["police"].audio_queue.put((pre_text, call_text))
 
-            embed = discord.Embed(
-                description=f"## <:phonecall:1568426067620798526> 911 Dispatch - {dept.upper()}",
-                color=discord.Color.red() if dept == "fire" else discord.Color.blue(),
-                timestamp=datetime.datetime.now(datetime.timezone.utc)
-            )
-            embed.add_field(name="Caller", value=call_caller, inline=True)
-            embed.add_field(name="Location", value=call_location, inline=True)
-            embed.add_field(name="Details", value=call_details, inline=False)
-            embed.set_footer(text="Ontario Border Roleplay System")
+                embed = discord.Embed(
+                    description=f"## <:phonecall:1568426067620798526> 911 Dispatch - {dept.upper()}",
+                    color=discord.Color.red() if dept == "fire" else discord.Color.blue(),
+                    timestamp=datetime.datetime.now(datetime.timezone.utc)
+                )
+                embed.add_field(name="Caller", value=call_caller, inline=True)
+                embed.add_field(name="Location", value=call_location, inline=True)
+                embed.add_field(name="Details", value=call_details, inline=False)
+                embed.set_footer(text="Ontario Border Roleplay System")
 
-            if dept in TEXT_CHANNELS:
-                dept_channel = main_bot.get_channel(TEXT_CHANNELS[dept])
-                if dept_channel: await dept_channel.send(embed=embed)
+                if dept in TEXT_CHANNELS:
+                    dept_channel = main_bot.get_channel(TEXT_CHANNELS[dept])
+                    if dept_channel: await dept_channel.send(embed=embed)
 
-            staff_channel = main_bot.get_channel(TEXT_CHANNELS["staff_log"])
-            if staff_channel: await staff_channel.send(embed=embed)
+                staff_channel = main_bot.get_channel(TEXT_CHANNELS["staff_log"])
+                if staff_channel: await staff_channel.send(embed=embed)
 
-            return web.Response(status=200, text="Dispatched")
-        
-        # Accept and acknowledge other ER:LC webhooks (like PlayerJoin, Server events)
-        return web.Response(status=200, text="Event Acknowledged")
+        return web.Response(status=200, text="Dispatched")
 
     except Exception as e:
         print(f"[WEBHOOK CRITICAL ERROR] {e}")
