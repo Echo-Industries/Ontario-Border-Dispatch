@@ -23,12 +23,11 @@ MAIN_BOT_TOKEN = os.getenv("MAIN_BOT_TOKEN")
 MELONLY_API_KEY = os.getenv("MELONLY_API_KEY")
 ERLC_SERVER_KEY = os.getenv("ERLC_SERVER_KEY")
 
-# ER:LC official Ed25519 Public Key for webhook signature validation
 _erlc_der_key = base64.b64decode("MCowBQYDK2VwAyEAjSICb9pp0kHizGQtdG8ySWsDChfGqi+gyFCttigBNOA=")
 ERLC_PUBLIC_KEY = VerifyKey(_erlc_der_key[-32:])
 
 # --- Channel Configuration ---
-WAITING_ROOM_ID = 1567191463203446804  # VC for Frequency Change
+WAITING_ROOM_ID = 1567191463203446804  
 
 WORKER_CONFIGS = {
     "police": {
@@ -49,19 +48,18 @@ WORKER_CONFIGS = {
 }
 
 TEXT_CHANNELS = {
-    "police": 1523672972764905492,  # CBSA text log
-    "fire": 1523673131959717938,    # OBFS text log
-    "dot": 1523673289791377448,     # MOT text log
-    "staff_log": 1568057421589643324 # All-calls staff log
+    "police": 1523672972764905492,  
+    "fire": 1523673131959717938,    
+    "dot": 1523673289791377448,     
+    "staff_log": 1568057421589643324 
 }
 
 ALLOWED_COMMAND_CHANNELS = [
-    1521204407687975113, # Bot Commands
-    1523575437278576660, # Staff Commands
-    1522723233286328484  # HR Commands
+    1521204407687975113, 
+    1523575437278576660, 
+    1522723233286328484  
 ]
 
-# --- Constants & APIs ---
 MELONLY_API_URL = "https://api.melonly.xyz/api/v1"
 ERLC_API_URL = "https://api.erlc.gg/v2/server"
 EMERGENCY_TEAMS = ["police", "sheriff", "fire", "rescue", "transportation", "dot"]
@@ -69,12 +67,13 @@ CALLSIGN_REGEX = re.compile(r"^[A-Z0-9\-]+\s\|\s.+")
 
 # --- Thread-Safe TTS Generator ---
 def generate_tts_file(text, filename):
-    """Generates the MP3 file safely without freezing the Discord client"""
     try:
+        print(f"[AUDIO] Generating TTS for: {text}")
         tts = gTTS(text=text, lang='en', slow=False)
         tts.save(filename)
+        print(f"[AUDIO] Successfully saved {filename} (Size: {os.path.getsize(filename)} bytes)")
     except Exception as e:
-        print(f"Failed to generate TTS: {e}")
+        print(f"[AUDIO ERROR] Failed to generate TTS: {e}")
 
 # --- API Fetcher Utility ---
 async def fetch_user_game_data(discord_id: int):
@@ -106,55 +105,77 @@ async def fetch_user_game_data(discord_id: int):
 
             return None, "not_in_game"
 
+# --- In-Game PM Utility ---
+async def send_in_game_pm(player_name: str, message: str):
+    """Executes an in-game :pm command via the ER:LC API"""
+    try:
+        async with aiohttp.ClientSession() as session:
+            headers = {"Server-Key": ERLC_SERVER_KEY, "Content-Type": "application/json"}
+            payload = {"command": f":pm {player_name} {message}"}
+            async with session.post(f"{ERLC_API_URL}/command", headers=headers, json=payload) as resp:
+                if resp.status == 200:
+                    print(f"[API] Successfully sent in-game PM to {player_name}")
+                else:
+                    print(f"[API ERROR] Failed to send PM to {player_name}. HTTP {resp.status}")
+    except Exception as e:
+        print(f"[API ERROR] PM Exception: {e}")
+
 # --- Worker Bot Class ---
 class DispatchWorker(discord.Client):
-    def __init__(self, dept_name, vc_id, bot_name, startup_delay):
+    def __init__(self, dept_name, vc_id, bot_name):
         intents = discord.Intents.default()
-        intents.voice_states = True # Required for reliable voice channel joining
+        intents.voice_states = True 
         super().__init__(intents=intents)
         self.dept_name = dept_name
         self.vc_id = vc_id
         self.bot_name = bot_name
-        self.startup_delay = startup_delay
         self.audio_queue = asyncio.Queue()
 
     async def setup_hook(self):
+        self.connection_watcher.start()
         self.loop.create_task(self.audio_processor())
-        print(f"{self.bot_name} online and monitoring {self.dept_name.upper()} RTO.")
+        print(f"[{self.bot_name}] Online and initialized.")
 
-    async def audio_processor(self):
-        await self.wait_until_ready()
-        
-        # Stagger startups to prevent Discord IP rate-limiting
-        await asyncio.sleep(self.startup_delay) 
-        
+    @tasks.loop(seconds=15)
+    async def connection_watcher(self):
+        """Persistent background task to guarantee VC connection"""
         channel = self.get_channel(self.vc_id)
         if not channel:
             try:
                 channel = await self.fetch_channel(self.vc_id)
             except Exception as e:
-                print(f"[{self.bot_name}] Could not find VC {self.vc_id}: {e}")
+                print(f"[{self.bot_name}] VC Fetch Error: {e}")
                 return
             
-        me = channel.guild.me
         vc = channel.guild.voice_client
-
-        while not vc or not vc.is_connected():
+        if not vc or not vc.is_connected():
+            print(f"[{self.bot_name}] Not in VC. Attempting connection to {self.dept_name.upper()} RTO...")
             try:
-                vc = await channel.connect()
+                await channel.connect()
+                print(f"[{self.bot_name}] ✅ Successfully connected to RTO.")
             except Exception as e:
-                print(f"[{self.bot_name}] Retrying connection to {self.dept_name.upper()} RTO... {e}")
-                await asyncio.sleep(5)
+                print(f"[{self.bot_name}] ❌ Connection failed: {e}")
 
+    async def audio_processor(self):
+        await self.wait_until_ready()
+        
         while True:
             pre_text, call_text = await self.audio_queue.get()
+            channel = self.get_channel(self.vc_id)
+            if not channel: continue
             
-            # Generate unique filenames to prevent overwrite collisions
+            vc = channel.guild.voice_client
+            me = channel.guild.me
+            
+            if not vc or not vc.is_connected():
+                print(f"[{self.bot_name}] Dropped audio because bot is not connected to VC.")
+                self.audio_queue.task_done()
+                continue
+
             uid = uuid.uuid4().hex
             pre_filename = f"pre_dispatch_{self.dept_name}_{uid}.mp3"
             call_filename = f"call_dispatch_{self.dept_name}_{uid}.mp3"
             
-            # Offload generation to a thread to prevent green-ring stalling
             await asyncio.to_thread(generate_tts_file, pre_text, pre_filename)
             await asyncio.to_thread(generate_tts_file, call_text, call_filename)
 
@@ -165,39 +186,41 @@ class DispatchWorker(discord.Client):
             except discord.Forbidden:
                 pass
 
-            if os.path.exists(pre_filename):
+            if os.path.exists(pre_filename) and os.path.getsize(pre_filename) > 100:
+                print(f"[{self.bot_name}] Playing pre-dispatch audio...")
                 vc.play(discord.FFmpegPCMAudio(pre_filename, options="-loglevel quiet"))
                 while vc.is_playing(): await asyncio.sleep(0.1)
+            else:
+                print(f"[{self.bot_name}] ❌ Pre-dispatch file missing or corrupted.")
 
             await asyncio.sleep(2.5)
 
-            if os.path.exists(call_filename):
+            if os.path.exists(call_filename) and os.path.getsize(call_filename) > 100:
+                print(f"[{self.bot_name}] Playing call dispatch audio...")
                 vc.play(discord.FFmpegPCMAudio(call_filename, options="-loglevel quiet"))
                 while vc.is_playing(): await asyncio.sleep(0.1)
+            else:
+                print(f"[{self.bot_name}] ❌ Call dispatch file missing or corrupted.")
                 
             try:
                 await channel.set_permissions(me, priority_speaker=None)
             except discord.Forbidden:
                 pass
                 
-            # Cleanup files to save Railway disk space
             await asyncio.sleep(1)
             if os.path.exists(pre_filename): os.remove(pre_filename)
             if os.path.exists(call_filename): os.remove(call_filename)
 
             self.audio_queue.task_done()
 
-# --- Initialize Worker Bots (With Staggered Delays) ---
+# --- Initialize Worker Bots ---
 workers = {}
-current_delay = 2
 for dept, config in WORKER_CONFIGS.items():
     workers[dept] = DispatchWorker(
         dept_name=dept, 
         vc_id=config["vc_id"], 
-        bot_name=config["name"], 
-        startup_delay=current_delay
+        bot_name=config["name"]
     )
-    current_delay += 5  # Each bot connects 5 seconds after the previous one
 
 # --- Main Bot Class (Ontario Border Dispatch) ---
 class MainBot(commands.Bot):
@@ -209,16 +232,19 @@ class MainBot(commands.Bot):
         super().__init__(command_prefix="!", intents=intents)
         self.start_time = time.time()
         self.waiting_room_empty_minutes = 0
+        self.cached_player_teams = {}
+        self.first_scan_complete = False
 
     async def setup_hook(self):
         await self.tree.sync()
         self.auto_sync_loop.start()
         self.waiting_room_timeout_loop.start()
-        print("Ontario Border Dispatch online.")
+        self.team_monitor_loop.start()
+        print("[MAIN] Ontario Border Dispatch online.")
 
     async def on_ready(self):
         startup_embed = discord.Embed(
-            description="## <:signal:1568381854497906738> Dispatch System Online\nOntario Border Dispatch and all departmental worker bots are now active and monitoring frequencies.",
+            description="## <:signal:1568381854497906738> Dispatch System Online\nOntario Border Dispatch and all departmental worker bots are now active and monitoring frequencies. We apologize for any downtime and thank you for your patience.",
             color=discord.Color.green(),
             timestamp=datetime.datetime.now(datetime.timezone.utc)
         )
@@ -230,7 +256,7 @@ class MainBot(commands.Bot):
                 try:
                     await channel.send(embed=startup_embed)
                 except discord.Forbidden:
-                    print(f"Missing permissions to send startup embed in {dept_name} channel.")
+                    print(f"[MAIN] Missing permissions to send startup embed in {dept_name} channel.")
 
     async def play_waiting_room_warning(self, text: str):
         channel = self.get_channel(WAITING_ROOM_ID)
@@ -241,7 +267,6 @@ class MainBot(commands.Bot):
         uid = uuid.uuid4().hex
         filename = f"main_warning_{uid}.mp3"
         
-        # Offload TTS generation
         await asyncio.to_thread(generate_tts_file, text, filename)
 
         vc = channel.guild.voice_client
@@ -252,11 +277,10 @@ class MainBot(commands.Bot):
 
         while vc.is_playing(): await asyncio.sleep(0.5)
         
-        if os.path.exists(filename):
+        if os.path.exists(filename) and os.path.getsize(filename) > 100:
             vc.play(discord.FFmpegPCMAudio(filename, options="-loglevel quiet"))
             while vc.is_playing(): await asyncio.sleep(0.1)
             
-            # Cleanup
             await asyncio.sleep(1)
             if os.path.exists(filename): os.remove(filename)
 
@@ -269,10 +293,91 @@ class MainBot(commands.Bot):
         if len(non_bots) == 0:
             self.waiting_room_empty_minutes += 1
             if self.waiting_room_empty_minutes >= 15:
+                print("[MAIN] Waiting room empty for 15 minutes. Disconnecting.")
                 await channel.guild.voice_client.disconnect()
                 self.waiting_room_empty_minutes = 0
         else:
             self.waiting_room_empty_minutes = 0
+
+    @tasks.loop(seconds=30)
+    async def team_monitor_loop(self):
+        """Polls ER:LC API to detect team changes and send PMs."""
+        if not ERLC_SERVER_KEY: return
+            
+        try:
+            async with aiohttp.ClientSession() as session:
+                headers = {"Server-Key": ERLC_SERVER_KEY}
+                async with session.get(ERLC_API_URL, headers=headers) as resp:
+                    if resp.status != 200: return
+                    erlc_data = await resp.json()
+                    players = erlc_data.get("Players", [])
+                    
+                    current_teams = {}
+                    
+                    for p in players:
+                        player_name = p.get("Player", "").split(":")[0]
+                        team = p.get("Team", "Civilian").lower()
+                        current_teams[player_name] = team
+                        
+                        is_emergency = any(k in team for k in EMERGENCY_TEAMS)
+                        
+                        if player_name in self.cached_player_teams:
+                            old_team = self.cached_player_teams[player_name]
+                            if old_team != team and is_emergency:
+                                print(f"[TEAM MONITOR] {player_name} joined {team.upper()}. Sending PM.")
+                                await send_in_game_pm(
+                                    player_name, 
+                                    "DISPATCH: Please wait 45 to 60 seconds for the database to sync before joining the Discord RTO."
+                                )
+                        else:
+                            if self.first_scan_complete and is_emergency:
+                                print(f"[TEAM MONITOR] New player {player_name} spawned as {team.upper()}. Sending PM.")
+                                await send_in_game_pm(
+                                    player_name, 
+                                    "DISPATCH: Please wait 45 to 60 seconds for the database to sync before joining the Discord RTO."
+                                )
+                                
+                    self.cached_player_teams = current_teams
+                    self.first_scan_complete = True
+        except Exception as e:
+            print(f"[TEAM MONITOR ERROR] {e}")
+
+    async def sync_member_rto(self, member, waiting_room):
+        """Processes a single member's RTO access with extensive logging"""
+        print(f"[SYNC] Processing {member.display_name} ({member.name})...")
+        player_data, status = await fetch_user_game_data(member.id)
+        
+        print(f"[SYNC] {member.name} API Result -> Status: {status} | Data: {player_data}")
+
+        if status != "success" or not player_data:
+            print(f"[SYNC KICK] {member.name} is not verified or not in game.")
+            await member.move_to(waiting_room, reason="Not verified or left game")
+            await self.play_waiting_room_warning("Attention player: You must be verified on Melonly and logged in to join RTO.")
+            return
+
+        team = player_data["team"].lower()
+        callsign = player_data["callsign"]
+        username = player_data["username"]
+        is_emergency = any(keyword in team for keyword in EMERGENCY_TEAMS)
+
+        if not is_emergency:
+            print(f"[SYNC KICK] {member.name} is on team: {team.upper()} (Civilian)")
+            await member.move_to(waiting_room, reason="Switched to Civilian")
+            await self.play_waiting_room_warning("Frequency change: You were moved to waiting room because you switched to the civilian team.")
+        elif not callsign:
+            print(f"[SYNC KICK] {member.name} is on team {team.upper()} but has no callsign.")
+            await member.move_to(waiting_room, reason="Dropped callsign")
+            await self.play_waiting_room_warning("Attention unit: Please set your in-game callsign before entering RTO.")
+        else:
+            new_nick = f"{callsign} | {username}"
+            if member.display_name != new_nick:
+                print(f"[SYNC UPDATE] Updating nickname for {member.name} to {new_nick}")
+                try:
+                    await member.edit(nick=new_nick)
+                except discord.Forbidden:
+                    print(f"[SYNC ERROR] Lacking permission to edit nickname for {member.name}")
+            else:
+                print(f"[SYNC OK] {member.name} is compliant.")
 
     @tasks.loop(seconds=60)
     async def auto_sync_loop(self):
@@ -281,34 +386,9 @@ class MainBot(commands.Bot):
                 if "RTO" in vc.name.upper():
                     for member in vc.members:
                         if member.bot: continue
-                        player_data, status = await fetch_user_game_data(member.id)
                         waiting_room = guild.get_channel(WAITING_ROOM_ID)
-
-                        if not waiting_room: continue
-
-                        if status != "success" or not player_data:
-                            await member.move_to(waiting_room, reason="Not verified or left game")
-                            await self.play_waiting_room_warning("Attention player: You must be verified on Melonly and logged in to join RTO.")
-                            continue
-
-                        team = player_data["team"].lower()
-                        callsign = player_data["callsign"]
-                        username = player_data["username"]
-                        is_emergency = any(keyword in team for keyword in EMERGENCY_TEAMS)
-
-                        if not is_emergency:
-                            await member.move_to(waiting_room, reason="Switched to Civilian")
-                            await self.play_waiting_room_warning("Frequency change: You were moved to waiting room because you switched to the civilian team.")
-                        elif not callsign:
-                            await member.move_to(waiting_room, reason="Dropped callsign")
-                            await self.play_waiting_room_warning("Attention unit: Please set your in-game callsign before entering RTO.")
-                        else:
-                            new_nick = f"{callsign} | {username}"
-                            if member.display_name != new_nick:
-                                try:
-                                    await member.edit(nick=new_nick)
-                                except discord.Forbidden:
-                                    pass
+                        if waiting_room:
+                            await self.sync_member_rto(member, waiting_room)
 
 main_bot = MainBot()
 
@@ -390,35 +470,9 @@ async def on_voice_state_update(member, before, after):
 
     if after.channel and "RTO" in after.channel.name.upper():
         waiting_room = member.guild.get_channel(WAITING_ROOM_ID)
-        if not waiting_room: return
-
-        player_data, status = await fetch_user_game_data(member.id)
-
-        if status != "success" or not player_data:
-            await member.move_to(waiting_room)
-            await main_bot.play_waiting_room_warning("Attention player: You must be verified on Melonly and logged in to join RTO.")
-            return
-
-        team = player_data["team"].lower()
-        callsign = player_data["callsign"]
-        username = player_data["username"]
-        is_emergency = any(k in team for k in EMERGENCY_TEAMS)
-
-        if not is_emergency:
-            await member.move_to(waiting_room)
-            await main_bot.play_waiting_room_warning("Frequency change: Civilians cannot join emergency radio channels.")
-            return
-        if not callsign:
-            await member.move_to(waiting_room)
-            await main_bot.play_waiting_room_warning("Attention unit: Please set your in-game callsign before entering RTO.")
-            return
-
-        new_nick = f"{callsign} | {username}"
-        try:
-            if member.display_name != new_nick:
-                await member.edit(nick=new_nick)
-        except discord.Forbidden:
-            pass
+        if waiting_room:
+            # Trigger sync immediately on join
+            await main_bot.sync_member_rto(member, waiting_room)
 
 # --- ER:LC Webhook Server (Audio, Text, & Web Page Routes) ---
 async def serve_index(request):
@@ -437,51 +491,69 @@ async def handle_erlc_webhook(request):
         timestamp_header = request.headers.get("X-Signature-Timestamp")
 
         if not signature_header or not timestamp_header:
+            print("[WEBHOOK ERROR] Missing security headers.")
             return web.Response(status=400, text="Missing signature headers")
 
         message = timestamp_header.encode("utf-8") + raw_body
         try:
             ERLC_PUBLIC_KEY.verify(message, bytes.fromhex(signature_header))
         except (BadSignatureError, ValueError):
+            print("[WEBHOOK ERROR] Invalid Ed25519 signature.")
             return web.Response(status=401, text="Invalid signature")
 
         data = await request.json()
-        call_caller = data.get("Caller", "Unknown Caller")
-        call_location = data.get("Location", "Unknown Location")
-        call_details = data.get("Details", "No details provided")
-        dept = data.get("Department", "police").lower()
+        event_type = data.get("Type", "Unknown")
+        
+        # Log all raw incoming webhook data for debugging purposes
+        print(f"[WEBHOOK RECEIVE] Type: {event_type} | Raw Data: {data}")
+        
+        # ER:LC natively wraps data inside a "Data" payload. Fallback to root just in case.
+        payload = data.get("Data", data)
 
-        if dept == "transportation": dept = "dot"
-        if dept == "sheriff": dept = "police" 
+        # Handle 911 Calls
+        if event_type == "Call911" or "Caller" in payload:
+            call_caller = payload.get("Caller", "Unknown Caller")
+            call_location = payload.get("Location", "Unknown Location")
+            call_details = payload.get("Details", "No details provided")
+            dept = payload.get("Department", "police").lower()
 
-        pre_text = "There is an incoming call, please silence the RTO."
-        call_text = f"Caller: {call_caller}. Description: {call_details}. Location: {call_location}."
+            if dept == "transportation": dept = "dot"
+            if dept == "sheriff": dept = "police" 
 
-        if dept in workers:
-            await workers[dept].audio_queue.put((pre_text, call_text))
-        elif "police" in workers:
-            await workers["police"].audio_queue.put((pre_text, call_text))
+            print(f"[DISPATCH] Routing {dept.upper()} call from {call_caller}")
 
-        embed = discord.Embed(
-            description=f"## 🚨 911 Dispatch - {dept.upper()}",
-            color=discord.Color.red() if dept == "fire" else discord.Color.blue(),
-            timestamp=datetime.datetime.now(datetime.timezone.utc)
-        )
-        embed.add_field(name="Caller", value=call_caller, inline=True)
-        embed.add_field(name="Location", value=call_location, inline=True)
-        embed.add_field(name="Details", value=call_details, inline=False)
-        embed.set_footer(text="Ontario Border Roleplay System")
+            pre_text = "There is an incoming call, please silence the RTO."
+            call_text = f"Caller: {call_caller}. Description: {call_details}. Location: {call_location}."
 
-        if dept in TEXT_CHANNELS:
-            dept_channel = main_bot.get_channel(TEXT_CHANNELS[dept])
-            if dept_channel: await dept_channel.send(embed=embed)
+            if dept in workers:
+                await workers[dept].audio_queue.put((pre_text, call_text))
+            elif "police" in workers:
+                await workers["police"].audio_queue.put((pre_text, call_text))
 
-        staff_channel = main_bot.get_channel(TEXT_CHANNELS["staff_log"])
-        if staff_channel: await staff_channel.send(embed=embed)
+            embed = discord.Embed(
+                description=f"## <:phonecall:1568426067620798526> 911 Dispatch - {dept.upper()}",
+                color=discord.Color.red() if dept == "fire" else discord.Color.blue(),
+                timestamp=datetime.datetime.now(datetime.timezone.utc)
+            )
+            embed.add_field(name="Caller", value=call_caller, inline=True)
+            embed.add_field(name="Location", value=call_location, inline=True)
+            embed.add_field(name="Details", value=call_details, inline=False)
+            embed.set_footer(text="Ontario Border Roleplay System")
 
-        return web.Response(status=200, text="Dispatched")
+            if dept in TEXT_CHANNELS:
+                dept_channel = main_bot.get_channel(TEXT_CHANNELS[dept])
+                if dept_channel: await dept_channel.send(embed=embed)
+
+            staff_channel = main_bot.get_channel(TEXT_CHANNELS["staff_log"])
+            if staff_channel: await staff_channel.send(embed=embed)
+
+            return web.Response(status=200, text="Dispatched")
+        
+        # Accept and acknowledge other ER:LC webhooks (like PlayerJoin, Server events)
+        return web.Response(status=200, text="Event Acknowledged")
+
     except Exception as e:
-        print(f"Webhook error: {e}")
+        print(f"[WEBHOOK CRITICAL ERROR] {e}")
         return web.Response(status=400, text="Bad Request")
 
 async def start_webhook_server():
@@ -496,7 +568,7 @@ async def start_webhook_server():
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", 8080)
     await site.start()
-    print("Webhook server listening on port 8080")
+    print("[SERVER] Webhook server listening on port 8080")
 
 # --- Async Startup Routine ---
 async def main():
