@@ -1,4 +1,5 @@
 import discord
+from discord import app_commands
 from discord.ext import commands, tasks
 import aiohttp
 from aiohttp import web
@@ -7,6 +8,8 @@ import re
 import os
 import shutil
 import logging
+import json
+import secrets
 import datetime
 import time
 import uuid
@@ -71,6 +74,37 @@ EMERGENCY_TEAMS = ["police", "sheriff", "fire", "rescue", "transportation", "dot
 # -vn: ignore any embedded cover art/video stream. -loglevel error: hide harmless bitrate warnings.
 FFMPEG_KWARGS = {"options": "-vn -loglevel error"}
 HTTP_TIMEOUT = aiohttp.ClientTimeout(total=10)
+
+# --- Discord <-> ER:LC account links (persisted). On Railway, mount a volume and set DATA_DIR to it. ---
+DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR / "data")))
+LINKS_PATH = DATA_DIR / "links.json"
+_links = {}          # discord_id (str) -> ER:LC username
+_pending_links = {}  # discord_id (str) -> {"name", "code", "expires", "created", "attempts"}
+
+
+def load_links():
+    global _links
+    try:
+        _links = json.loads(LINKS_PATH.read_text(encoding="utf-8"))
+        print(f"[LINKS] Loaded {len(_links)} linked account(s).")
+    except FileNotFoundError:
+        _links = {}
+    except Exception as e:
+        print(f"[LINKS ERROR] Could not read {LINKS_PATH}: {e}")
+        _links = {}
+
+
+def save_links():
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = LINKS_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(_links, indent=2), encoding="utf-8")
+        os.replace(tmp, LINKS_PATH)
+    except Exception as e:
+        print(f"[LINKS ERROR] Could not save links: {e}")
+
+
+load_links()
 
 
 # --- TTS ---
@@ -319,6 +353,15 @@ async def fetch_user_game_data(member: discord.Member):
     if players is None:
         return None, "erlc_error"
 
+    # 1. Verified /link (authoritative)
+    linked = _links.get(str(member.id))
+    if linked:
+        for p in players:
+            if parse_player_name(p).lower() == linked.lower():
+                return _player_dict(p), "success"
+        return None, "not_in_game"
+
+    # 2. Melonly (currently exposes no Roblox data, but kept in case that changes)
     roblox_username = await fetch_melonly_username(member.id)
 
     if roblox_username:
@@ -495,6 +538,7 @@ class MainBot(commands.Bot):
         self.warning_lock = asyncio.Lock()
         self.syncing = set()
         self._announced = False
+        self._nick_warned = {}
 
     async def setup_hook(self):
         await self.tree.sync()
@@ -621,7 +665,7 @@ class MainBot(commands.Bot):
         if status != "success" or not data:
             await self.kick_to_waiting_room(
                 member, waiting_room, "Not verified or left game",
-                "Attention player: You must be verified on Melonly and logged in. Additionally, you must be on the appropriate team in-game to join the team's RTO.")
+                "Attention player: We could not match your Discord account to a player in the game. Join the game on the correct team, then use the link command in the bot channel.")
             return
 
         team, callsign, username = data["team"].lower(), data["callsign"], data["username"]
@@ -641,11 +685,11 @@ class MainBot(commands.Bot):
                     await member.edit(nick=new_nick, reason="Callsign sync")
                     print(f"[SYNC UPDATE] Updated {member.name} to {new_nick}")
                 except discord.Forbidden:
+                    # Verified, on-team and in game: never kick over a nickname the bot can't change.
                     print(f"[SYNC] Cannot edit {member.name}: higher role than the bot (or server owner).")
-                    await send_in_game_pm(username, f"DISPATCH: I cannot set your Discord nickname. Please change it manually to: {new_nick}")
-                    await self.kick_to_waiting_room(
-                        member, waiting_room, "Bot lacks permission to enforce callsign formatting",
-                        "Attention unit: Your Discord role is too high for me to set your callsign. Please set your nickname manually.")
+                    if time.monotonic() - self._nick_warned.get(member.id, 0) > 600:
+                        self._nick_warned[member.id] = time.monotonic()
+                        await send_in_game_pm(username, f"DISPATCH: I cannot change your Discord nickname. Please set it manually to: {new_nick}")
                 except discord.HTTPException as e:
                     print(f"[SYNC ERROR] Nickname edit failed for {member.name}: {e}")
 
@@ -739,6 +783,85 @@ async def botstatus(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed)
 
 
+def _wrong_channel_msg():
+    return f"❌ Commands can only be used in designated bot channels (e.g., <#{ALLOWED_COMMAND_CHANNELS[0]}>)."
+
+
+@main_bot.tree.command(name="link", description="Link your Discord account to your in-game ER:LC username")
+@app_commands.describe(username="Your exact in-game (Roblox) username. You must be in the ER:LC server right now.")
+async def link_cmd(interaction: discord.Interaction, username: str):
+    if interaction.channel_id not in ALLOWED_COMMAND_CHANNELS:
+        await interaction.response.send_message(_wrong_channel_msg(), ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    uid = str(interaction.user.id)
+
+    pending = _pending_links.get(uid)
+    if pending and time.monotonic() - pending["created"] < 30:
+        await interaction.followup.send("⏳ Please wait 30 seconds before requesting another code.", ephemeral=True)
+        return
+
+    players = await fetch_erlc_players()
+    if players is None:
+        await interaction.followup.send("❌ I couldn't reach the ER:LC server right now. Try again shortly.", ephemeral=True)
+        return
+
+    wanted = username.strip().lower()
+    match = next((parse_player_name(p) for p in players if parse_player_name(p).lower() == wanted), None)
+    if not match:
+        await interaction.followup.send(f"❌ I can't see **{username.strip()}** in the game. Join the server first and check the spelling.", ephemeral=True)
+        return
+
+    code = f"{secrets.randbelow(10**6):06d}"
+    now = time.monotonic()
+    _pending_links[uid] = {"name": match, "code": code, "expires": now + 300, "created": now, "attempts": 0}
+    await send_in_game_pm(match, f"DISPATCH: Your Discord link code is {code}. Enter it with /verify in Discord. If this was not you, ignore this.")
+    await interaction.followup.send(f"📩 I sent a 6-digit code to **{match}** in-game (check your PMs). Run `/verify code:<code>` within 5 minutes.", ephemeral=True)
+
+
+@main_bot.tree.command(name="verify", description="Finish linking with the code sent to you in-game")
+@app_commands.describe(code="The 6-digit code from your in-game PM")
+async def verify_cmd(interaction: discord.Interaction, code: str):
+    if interaction.channel_id not in ALLOWED_COMMAND_CHANNELS:
+        await interaction.response.send_message(_wrong_channel_msg(), ephemeral=True)
+        return
+    uid = str(interaction.user.id)
+    pending = _pending_links.get(uid)
+    if not pending or time.monotonic() > pending["expires"]:
+        _pending_links.pop(uid, None)
+        await interaction.response.send_message("❌ No active link request. Run `/link` first.", ephemeral=True)
+        return
+
+    if not secrets.compare_digest(code.strip(), pending["code"]):
+        pending["attempts"] += 1
+        if pending["attempts"] >= 5:
+            _pending_links.pop(uid, None)
+            await interaction.response.send_message("❌ Too many wrong codes. Run `/link` again.", ephemeral=True)
+        else:
+            await interaction.response.send_message("❌ That code is incorrect.", ephemeral=True)
+        return
+
+    name = pending["name"]
+    for other_id in [k for k, v in _links.items() if v.lower() == name.lower() and k != uid]:
+        del _links[other_id]  # the in-game owner of the name wins
+    _links[uid] = name
+    save_links()
+    _pending_links.pop(uid, None)
+    await interaction.response.send_message(f"✅ Linked to **{name}**. You can join your RTO now.", ephemeral=True)
+
+
+@main_bot.tree.command(name="unlink", description="Remove the link between your Discord account and your in-game username")
+async def unlink_cmd(interaction: discord.Interaction):
+    if interaction.channel_id not in ALLOWED_COMMAND_CHANNELS:
+        await interaction.response.send_message(_wrong_channel_msg(), ephemeral=True)
+        return
+    if _links.pop(str(interaction.user.id), None):
+        save_links()
+        await interaction.response.send_message("✅ Your link was removed.", ephemeral=True)
+    else:
+        await interaction.response.send_message("You don't have a linked account.", ephemeral=True)
+
+
 @main_bot.event
 async def on_message(message):
     if message.author.bot:
@@ -774,19 +897,26 @@ def file_handler(path: Path):
     return handler
 
 
+def _signature_candidates(signature: str):
+    """Hex, standard Base64 and URL-safe Base64 (padded or not). Wrong-length decodes are filtered later."""
+    signature = signature.strip()
+    out = []
+    try:
+        out.append(bytes.fromhex(signature))
+    except ValueError:
+        pass
+    padded = signature + "=" * (-len(signature) % 4)
+    for decoder in (base64.b64decode, base64.urlsafe_b64decode):
+        try:
+            out.append(decoder(padded))
+        except ValueError:
+            pass
+    return out
+
+
 def verify_erlc_signature(signature: str, timestamp: str, body: bytes) -> bool:
-    """ER:LC currently sends Base64 Ed25519 signatures; older deliveries used Hex. Accept both."""
     message = timestamp.encode("utf-8") + body
-    candidates = []
-    try:
-        candidates.append(bytes.fromhex(signature))
-    except ValueError:
-        pass
-    try:
-        candidates.append(base64.b64decode(signature, validate=True))
-    except ValueError:
-        pass
-    for sig in candidates:
+    for sig in _signature_candidates(signature):
         if len(sig) != 64:
             continue
         try:
@@ -797,43 +927,68 @@ def verify_erlc_signature(signature: str, timestamp: str, body: bytes) -> bool:
     return False
 
 
-async def handle_911_event(payload: dict):
-    call_caller = str(payload.get("Caller", "Unknown Caller"))
-    call_location = str(payload.get("Location", "Unknown Location"))
-    call_details = str(payload.get("Details", "No details provided"))
-    dept = str(payload.get("Department") or "police").lower()
+def clean_field(value, default, limit=1024):
+    """Discord rejects empty or oversized embed fields; ER:LC can send empty strings."""
+    text = str(value).strip() if value is not None else ""
+    return (text or default)[:limit]
 
-    if dept == "transportation":
+
+async def get_text_channel(key):
+    channel_id = TEXT_CHANNELS[key]
+    channel = main_bot.get_channel(channel_id)
+    if channel:
+        return channel
+    try:
+        return await main_bot.fetch_channel(channel_id)
+    except Exception as e:
+        print(f"[WEBHOOK] Cannot find '{key}' channel {channel_id}: {type(e).__name__}: {e}")
+        return None
+
+
+async def handle_911_event(payload: dict):
+    print(f"[WEBHOOK] Call911 payload keys: {list(payload.keys())}")
+    call_caller = clean_field(payload.get("Caller"), "Unknown Caller", 256)
+    call_location = clean_field(payload.get("Location") or payload.get("PositionDescriptor") or payload.get("Position"), "Unknown Location", 256)
+    call_details = clean_field(payload.get("Details") or payload.get("Description"), "No details provided", 1024)
+    dept = str(payload.get("Department") or payload.get("Team") or "police").strip().lower()
+
+    if dept in ("transportation", "department of transportation"):
         dept = "dot"
     if dept == "sheriff":
         dept = "police"
 
     print(f"[DISPATCH] Routing {dept.upper()} call from {call_caller}")
 
+    # Audio first (unchanged behaviour), then the embeds; each isolated so one failure can't block the other.
     pre_text = "There is an incoming call, please silence the RTO."
     call_text = f"Caller: {call_caller}. Description: {call_details}. Location: {call_location}."
-
     target = workers.get(dept) or workers.get("police")
     if target:
         await target.audio_queue.put((pre_text, call_text))
 
-    embed = discord.Embed(
-        description=f"## <:phonecall:1568426067620798526> 911 Dispatch - {dept.upper()}",
-        color=discord.Color.red() if dept == "fire" else discord.Color.blue(),
-        timestamp=datetime.datetime.now(datetime.timezone.utc),
-    )
-    embed.add_field(name="Caller", value=call_caller, inline=True)
-    embed.add_field(name="Location", value=call_location, inline=True)
-    embed.add_field(name="Details", value=call_details, inline=False)
-    embed.set_footer(text="Ontario Border Roleplay System")
+    try:
+        embed = discord.Embed(
+            description=f"## <:phonecall:1568426067620798526> 911 Dispatch - {dept.upper()}",
+            color=discord.Color.red() if dept == "fire" else discord.Color.blue(),
+            timestamp=datetime.datetime.now(datetime.timezone.utc),
+        )
+        embed.add_field(name="Caller", value=call_caller, inline=True)
+        embed.add_field(name="Location", value=call_location, inline=True)
+        embed.add_field(name="Details", value=call_details, inline=False)
+        embed.set_footer(text="Ontario Border Roleplay System")
+    except Exception as e:
+        print(f"[WEBHOOK] Could not build 911 embed: {type(e).__name__}: {e}")
+        return
 
-    for key in ([dept] if dept in TEXT_CHANNELS else []) + ["staff_log"]:
-        channel = main_bot.get_channel(TEXT_CHANNELS[key])
-        if channel:
-            try:
-                await channel.send(embed=embed)
-            except discord.HTTPException as e:
-                print(f"[WEBHOOK] Could not post to {key} log: {e}")
+    for key in ([dept] if dept in TEXT_CHANNELS and dept != "staff_log" else []) + ["staff_log"]:
+        channel = await get_text_channel(key)
+        if not channel:
+            continue
+        try:
+            await channel.send(embed=embed)
+            print(f"[WEBHOOK] 911 embed posted to {key} log.")
+        except Exception as e:
+            print(f"[WEBHOOK] Could not post 911 embed to {key} log: {type(e).__name__}: {e}")
 
 
 async def handle_erlc_webhook(request):
@@ -845,7 +1000,7 @@ async def handle_erlc_webhook(request):
             return web.Response(status=400, text="Missing signature headers")
 
         if not verify_erlc_signature(signature, timestamp, raw_body):
-            print("[WEBHOOK ERROR] Invalid Ed25519 signature.")
+            print(f"[WEBHOOK ERROR] Invalid Ed25519 signature (header length {len(signature)}).")
             return web.Response(status=401, text="Invalid signature")
 
         data = await request.json()
@@ -857,6 +1012,7 @@ async def handle_erlc_webhook(request):
                 if not isinstance(event_payload, dict):
                     continue
                 event_type = event_payload.get("event", event_payload.get("Type", "Unknown"))
+                print(f"[WEBHOOK] Received event: {event_type}")
                 if event_type == "WebhookProbe":
                     print("[WEBHOOK] Received ER:LC probe. Validated and acknowledged.")
                     continue
