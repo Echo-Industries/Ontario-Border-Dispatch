@@ -6,6 +6,7 @@ import asyncio
 import re
 import os
 import shutil
+import logging
 import datetime
 import time
 import uuid
@@ -92,6 +93,7 @@ async def play_file(vc: discord.VoiceClient, filename: str) -> bool:
     while vc.is_playing():
         await asyncio.sleep(0.2)
 
+    await wait_for_dave(vc)
     loop = asyncio.get_running_loop()
     done = asyncio.Event()
 
@@ -107,6 +109,21 @@ async def play_file(vc: discord.VoiceClient, filename: str) -> bool:
         print("[AUDIO ERROR] Playback timed out, stopping.")
         vc.stop()
     return True
+
+
+async def wait_for_dave(vc, timeout=8.0):
+    """Logs DAVE state and waits briefly for the E2EE session to be ready before sending audio."""
+    conn = getattr(vc, "_connection", None)
+    sess = getattr(conn, "dave_session", None)
+    print(f"[DAVE] protocol={getattr(conn, 'dave_protocol_version', '?')} session={'yes' if sess else 'NONE'} ready={getattr(sess, 'ready', '?')}")
+    if sess is None:
+        return
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        if getattr(sess, "ready", True):
+            return
+        await asyncio.sleep(0.25)
+    print("[DAVE] Session still not ready; audio may be silent.")
 
 
 def safe_remove(*paths):
@@ -157,6 +174,7 @@ _melonly_cache = {}  # discord_id -> (timestamp, username | None)
 _melonly_snapshot = {"ts": 0.0, "map": {}}
 _melonly_lock = asyncio.Lock()
 _melonly_debug_printed = False
+_melonly_unusable_until = 0.0  # backoff when the API exposes no Roblox/Discord link data
 
 
 def _str(v):
@@ -233,12 +251,18 @@ async def _refresh_melonly_snapshot(session):
             _melonly_debug_printed = True
             first = records[0]
             print(f"[MELONLY DEBUG] No usable record. Sample keys: {list(first.keys()) if isinstance(first, dict) else type(first)}")
+        if records and not found:
+            global _melonly_unusable_until
+            _melonly_unusable_until = time.monotonic() + 3600
+            break
         page += 1
     _melonly_snapshot.update(ts=time.monotonic(), map=found)
 
 
 async def fetch_melonly_username(discord_id: int):
     key = str(discord_id)
+    if time.monotonic() < _melonly_unusable_until:
+        return None
     async with _melonly_lock:
         cached = _melonly_cache.get(key)
         if cached:
@@ -343,6 +367,8 @@ class DispatchWorker(discord.Client):
         self.connect_lock = asyncio.Lock()
         self._last_error = None
         self._processor_task = None
+        self._connect_count = 0
+        self._last_connect = 0.0
 
     async def setup_hook(self):
         self.connection_watcher.start()
@@ -365,12 +391,27 @@ class DispatchWorker(discord.Client):
                 if vc.channel.id != channel.id:
                     await vc.move_to(channel)
                 return vc
-            if vc:  # stale half-dead client blocks reconnects
+            if vc:
+                # discord.py may be mid auto-reconnect; give it time before tearing it down
+                for _ in range(30):
+                    await asyncio.sleep(0.5)
+                    if vc.is_connected():
+                        return vc
+                print(f"[{self.bot_name}] Voice client stuck disconnected for 15s; recreating.")
                 await vc.disconnect(force=True)
             vc = await channel.connect(timeout=20.0, reconnect=True)
             await asyncio.sleep(1.0)  # let the DAVE/E2EE handshake settle before audio
-            print(f"[{self.bot_name}] ✅ Connected to RTO.")
+            now = time.monotonic()
+            self._connect_count += 1
+            gap = f"{now - self._last_connect:.0f}s since last" if self._last_connect else "first"
+            self._last_connect = now
+            print(f"[{self.bot_name}] ✅ Connected to RTO (#{self._connect_count}, {gap}).")
             return vc
+
+    async def on_voice_state_update(self, member, before, after):
+        # Shows whether Discord/someone is removing THIS bot from the channel.
+        if self.user and member.id == self.user.id and before.channel != after.channel:
+            print(f"[{self.bot_name}] Voice state: {before.channel} -> {after.channel}")
 
     @tasks.loop(seconds=15)
     async def connection_watcher(self):
@@ -861,6 +902,10 @@ async def run_bot(name, client, token):
 
 
 async def main():
+    discord.utils.setup_logging(level=logging.INFO)
+    if os.getenv("VOICE_DEBUG"):
+        logging.getLogger("discord.voice_state").setLevel(logging.DEBUG)
+        logging.getLogger("discord.voice_client").setLevel(logging.DEBUG)
     if not shutil.which("ffmpeg"):
         print("[STARTUP] CRITICAL: ffmpeg not found on PATH. No audio will play.")
     for var, val in (("MAIN_BOT_TOKEN", MAIN_BOT_TOKEN), ("ERLC_SERVER_KEY", ERLC_SERVER_KEY), ("MELONLY_API_KEY", MELONLY_API_KEY)):
