@@ -9,6 +9,7 @@ import os
 import shutil
 import logging
 import json
+import signal
 import secrets
 import datetime
 import time
@@ -74,6 +75,9 @@ EMERGENCY_TEAMS = ["police", "sheriff", "fire", "rescue", "transportation", "dot
 # -vn: ignore any embedded cover art/video stream. -loglevel error: hide harmless bitrate warnings.
 FFMPEG_KWARGS = {"options": "-vn -loglevel error"}
 HTTP_TIMEOUT = aiohttp.ClientTimeout(total=10)
+# Seconds workers wait after login before joining voice, so a previous deployment that is still
+# shutting down (same bot tokens) is gone and cannot fight over the voice session.
+VOICE_STARTUP_DELAY = float(os.getenv("VOICE_STARTUP_DELAY", "20"))
 
 # --- Discord <-> ER:LC account links (persisted). On Railway, mount a volume and set DATA_DIR to it. ---
 DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR / "data")))
@@ -472,6 +476,7 @@ class DispatchWorker(discord.Client):
     @connection_watcher.before_loop
     async def before_watcher(self):
         await self.wait_until_ready()
+        await asyncio.sleep(VOICE_STARTUP_DELAY)
 
     async def play_dispatch(self, pre_text, call_text):
         channel = await self._get_channel()
@@ -1057,11 +1062,24 @@ async def run_bot(name, client, token):
         print(f"[STARTUP ERROR] {name} crashed: {type(e).__name__}: {e}")
 
 
+async def shutdown_client(client):
+    """Stop background loops (so nothing reconnects) and close the client, which leaves voice cleanly."""
+    for name in ("connection_watcher", "auto_sync_loop", "waiting_room_timeout_loop", "team_monitor_loop"):
+        loop_obj = getattr(client, name, None)
+        if loop_obj is not None:
+            loop_obj.cancel()
+    try:
+        await client.close()
+    except Exception as e:
+        print(f"[SHUTDOWN] Error closing client: {type(e).__name__}: {e}")
+
+
 async def main():
     discord.utils.setup_logging(level=logging.INFO)
     if os.getenv("VOICE_DEBUG"):
         logging.getLogger("discord.voice_state").setLevel(logging.DEBUG)
         logging.getLogger("discord.voice_client").setLevel(logging.DEBUG)
+    print(f"[STARTUP] deployment={os.getenv('RAILWAY_DEPLOYMENT_ID', 'local')} replica={os.getenv('RAILWAY_REPLICA_ID', '-')}")
     if not shutil.which("ffmpeg"):
         print("[STARTUP] CRITICAL: ffmpeg not found on PATH. No audio will play.")
     for var, val in (("MAIN_BOT_TOKEN", MAIN_BOT_TOKEN), ("ERLC_SERVER_KEY", ERLC_SERVER_KEY), ("MELONLY_API_KEY", MELONLY_API_KEY)):
@@ -1070,15 +1088,35 @@ async def main():
     if not MAIN_BOT_TOKEN:
         return
 
+    stop_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, stop_event.set)
+        except (NotImplementedError, RuntimeError):
+            pass
+
     await start_webhook_server()
 
+    clients = [main_bot]
     jobs = [run_bot("Main bot", main_bot, MAIN_BOT_TOKEN)]
     for dept, config in WORKER_CONFIGS.items():
         if config["token"]:
+            clients.append(workers[dept])
             jobs.append(run_bot(config["name"], workers[dept], config["token"]))
         else:
             print(f"[STARTUP] WARNING: no token for {config['name']}; worker disabled.")
-    await asyncio.gather(*jobs)
+
+    bot_tasks = [asyncio.create_task(j) for j in jobs]
+    all_done = asyncio.gather(*bot_tasks)
+    stopper = asyncio.create_task(stop_event.wait())
+    await asyncio.wait([stopper, all_done], return_when=asyncio.FIRST_COMPLETED)
+
+    if stop_event.is_set():
+        print("[SHUTDOWN] Signal received; leaving voice channels and closing bots.")
+        await asyncio.gather(*(shutdown_client(c) for c in clients), return_exceptions=True)
+        await asyncio.wait([all_done], timeout=10)
+    stopper.cancel()
 
 
 if __name__ == "__main__":
