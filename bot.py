@@ -15,10 +15,10 @@ from nacl.exceptions import BadSignatureError
 from gtts import gTTS
 from dotenv import load_dotenv
 
-# --- DAVE E2EE Voice Patch ---
+# --- DAVE E2EE Voice Support ---
+# discord.py automatically detects this import and handles the encryption natively.
 try:
     import davey
-    davey.patch() # CRITICAL: This injects the E2EE encryption into discord.py
     DAVEY_INSTALLED = True
 except ImportError:
     DAVEY_INSTALLED = False
@@ -265,7 +265,7 @@ class MainBot(commands.Bot):
         
         print(f"[MAIN] Ontario Border Dispatch online. (discord.py v{discord.__version__})")
         if not DAVEY_INSTALLED:
-            print("[MAIN] CRITICAL WARNING: 'davey' library is missing or failed to patch!")
+            print("[MAIN] CRITICAL WARNING: 'davey' library is missing. E2EE encryption will fail!")
 
     async def on_ready(self):
         startup_embed = discord.Embed(
